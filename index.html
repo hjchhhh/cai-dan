@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<!-- viewport-fit=cover 配合下方 env() 安全区，刘海屏不会被遮挡 -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="format-detection" content="telephone=no,email=no,address=no">
+<meta name="theme-color" content="#1a1a1a">
+<title>菜单</title>
+<style>
+    * {
+        margin: 0; padding: 0; box-sizing: border-box;
+        -webkit-touch-callout: none;              /* 关闭长按弹菜单 */
+        -webkit-user-select: none; user-select: none;
+        -webkit-tap-highlight-color: transparent; /* 关闭点击高亮，避免闪烁 */
+    }
+
+    /* ============================================================
+       ① 文档层：把整页彻底锁死在一个屏幕里
+       html/body 都用 fixed + 四边贴边，再配合 touch-action:none，
+       从根上掐断微信 iOS(WKWebView) 的下拉回弹和安卓 X5 的橡皮筋。
+       ============================================================ */
+    html, body {
+        width: 100%; height: 100%;
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        overflow: hidden;
+        background: #1a1a1a;
+        overscroll-behavior: none;
+        touch-action: none;
+        -webkit-overflow-scrolling: auto;
+    }
+
+    /* 加载层 */
+    #loading {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: #1a1a1a;
+        display: -webkit-flex; display: flex;
+        -webkit-align-items: center; align-items: center;
+        -webkit-justify-content: center; justify-content: center;
+        z-index: 9999;
+        color: #cfa972; font-size: 15px; letter-spacing: 2px;
+        -webkit-transition: opacity .45s ease; transition: opacity .45s ease;
+        -webkit-transform: translateZ(0); transform: translateZ(0);
+    }
+    #loading.hide { opacity: 0; pointer-events: none; }
+
+    /* ============================================================
+       ② 舞台：只负责居中 + 安全区
+       pointer-events:none 让书页永远不可能成为触摸目标
+       ============================================================ */
+    #stage {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        z-index: 10;
+        display: -webkit-flex; display: flex;
+        -webkit-align-items: center; align-items: center;
+        -webkit-justify-content: center; justify-content: center;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+        overflow: hidden;
+        pointer-events: none;
+    }
+
+    /* 边界橡皮筋层（不干扰翻书库自身的 3D 变换） */
+    #bookLayer { position: relative; }
+
+    #book {
+        position: relative;
+        opacity: 0;                                   /* 图片全部就绪后再显示，绝不出现半张图/白闪 */
+        -webkit-transition: opacity .3s ease; transition: opacity .3s ease;
+    }
+    #book.show { opacity: 1; }
+
+    /* ============================================================
+       ③ 书页：删掉 CSS box-shadow（3D 翻页每帧重新光栅化，大阴影极贵），
+       阴影交给库自带的 maxShadowOpacity 渐变层
+       ============================================================ */
+    .page {
+        background-color: #1a1a1a;
+        overflow: hidden;
+        -webkit-transform: translateZ(0); transform: translateZ(0);
+        -webkit-backface-visibility: hidden; backface-visibility: hidden;
+        box-shadow: none !important;
+    }
+    .page img {
+        width: 100%; height: 100%;
+        object-fit: contain;
+        display: block;
+        pointer-events: none;
+        -webkit-backface-visibility: hidden; backface-visibility: hidden;
+        -webkit-user-drag: none;
+    }
+
+    /* ============================================================
+       ④ 手势层：全屏透明，盖在书上面。所有 touch/mouse 只命中这一层
+       ============================================================ */
+    #gesture {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        z-index: 50;
+        background: transparent;
+        touch-action: none;
+    }
+</style>
+</head>
+<body>
+
+    <div id="stage">
+        <div id="bookLayer">
+            <div id="book">
+                <div class="page"><img src="1.jpg" alt="1"></div>
+                <div class="page"><img src="2.jpg" alt="2"></div>
+                <div class="page"><img src="3.jpg" alt="3"></div>
+                <div class="page"><img src="4.jpg" alt="4"></div>
+                <div class="page"><img src="5.jpg" alt="5"></div>
+                <div class="page"><img src="6.jpg" alt="6"></div>
+                <div class="page"><img src="7.jpg" alt="7"></div>
+                <div class="page"><img src="8.jpg" alt="8"></div>
+                <div class="page"><img src="9.jpg" alt="9"></div>
+                <div class="page"><img src="10.jpg" alt="10"></div>
+                <div class="page"><img src="11.jpg" alt="11"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="gesture"></div>
+    <div id="loading">菜单加载中 0%</div>
+
+    <script src="page-flip.browser.js"></script>
+    <script>
+    (function () {
+        'use strict';
+
+        /* =========================================================
+           0. 配置区
+           ========================================================= */
+        var CFG = {
+            flippingTime: 650,      // 翻页时长(ms)，默认 1000ms 太长容易掉帧
+            maxShadowOpacity: 0.08, // 阴影不透明度(原 0.15)，深色背景下观感几乎无差，但每帧梯度绘制量更小
+            swipeThreshold: 34,     // 水平位移超过它 => 立即翻页（跟手）
+            releaseSwipe: 14,       // 松手时未到阈值但超过它，也补判为滑动
+            tapMove: 10,            // 位移小于它才算“点击”
+            tapMaxTime: 350,        // 点击时长上限(ms)
+            dirRatio: 1.2,          // 水平位移 > 垂直位移 * 1.2 才算横向手势
+            rubberMax: 18,          // 到边界时的橡皮筋最大位移(px)
+            watchDelay: 1150,       // 看门狗：必须明显大于 flippingTime（库的 flip 事件在动画结束后才触发）
+            lockStale: 1200,        // 锁“陈旧”阈值：超过它就认为 changeState 事件丢了，自愈解锁
+            enableDownscale: true,  // 内存优化总开关：按屏幕像素重采样图片
+            maxScale: 2,            // 重采样最大像素密度；内存吃紧可改 1.5
+            debug: false            // 真机排查时改成 true，会在控制台打印每次翻页的判定过程
+        };
+
+        /* =========================================================
+           1. 基础工具
+           ========================================================= */
+        function viewport() {
+            var d = document.documentElement;
+            return { w: d.clientWidth || window.innerWidth, h: d.clientHeight || window.innerHeight };
+        }
+
+        // 舞台内容区尺寸（已扣掉安全区 padding）
+        function stageBox() {
+            var s = document.getElementById('stage');
+            var r = s.getBoundingClientRect();
+            var cs = window.getComputedStyle(s);
+            var pl = parseFloat(cs.paddingLeft) || 0, pr = parseFloat(cs.paddingRight) || 0;
+            var pt = parseFloat(cs.paddingTop) || 0, pb = parseFloat(cs.paddingBottom) || 0;
+            return { w: Math.max(1, r.width - pl - pr), h: Math.max(1, r.height - pt - pb) };
+        }
+
+        function waitImg(img) {
+            return new Promise(function (resolve) {
+                if (img.complete && img.naturalWidth) { resolve(img); return; }
+                var t = setTimeout(function () { resolve(img); }, 8000);   // 单张兜底
+                var done = function () {
+                    clearTimeout(t);
+                    img.removeEventListener('load', done);
+                    img.removeEventListener('error', done);
+                    resolve(img);
+                };
+                img.addEventListener('load', done);
+                img.addEventListener('error', done);
+            });
+        }
+
+        function decodeImg(img) {
+            if (img.decode) {
+                return img.decode().then(function () { return img; }, function () { return img; });
+            }
+            return Promise.resolve(img);
+        }
+
+        /* ---------------------------------------------------------
+           内存优化（切后台被杀进程的根因之一）
+           不再用 new Image() 预加载（那会把 11 张大图又解码一份），
+           直接用 DOM 里真实的 <img> 预加载 + 按屏幕像素重采样。
+           --------------------------------------------------------- */
+        function shrink(img, maxW, maxH) {
+            if (!CFG.enableDownscale) return Promise.resolve(img);
+            try {
+                var nw = img.naturalWidth, nh = img.naturalHeight;
+                if (!nw || !nh) return Promise.resolve(img);
+                var k = Math.min(maxW / nw, maxH / nh);
+                if (k >= 0.999) return Promise.resolve(img);       // 原图本来就不大
+                var w = Math.max(1, Math.round(nw * k));
+                var h = Math.max(1, Math.round(nh * k));
+                var cv = document.createElement('canvas');
+                cv.width = w; cv.height = h;
+                var ctx = cv.getContext('2d');
+                if (!ctx) return Promise.resolve(img);
+                ctx.drawImage(img, 0, 0, w, h);
+                var url = cv.toDataURL('image/jpeg', 0.92);
+                cv.width = 0; cv.height = 0;                        // 立刻释放 canvas 位图内存
+                if (!url || url.length < 200) return Promise.resolve(img);
+                img.src = url;
+                return waitImg(img).then(decodeImg);
+            } catch (e) {
+                return Promise.resolve(img);                        // 任何异常都不影响启动
+            }
+        }
+
+        function prepareAll() {
+            var imgs = document.querySelectorAll('#book img');
+            var n = imgs.length, done = 0;
+            var tip = document.getElementById('loading');
+            var vp = viewport();
+            var dpr = Math.min(window.devicePixelRatio || 1, CFG.maxScale);
+            var maxW = Math.round(vp.w * dpr);
+            var maxH = Math.round(vp.h * dpr);
+            var tasks = [];
+            for (var i = 0; i < n; i++) {
+                tasks.push(function (img) {
+                    return waitImg(img)
+                        .then(decodeImg)
+                        .then(function (im) { return shrink(im, maxW, maxH); })
+                        .then(function () {
+                            done++;
+                            if (tip) tip.textContent = '菜单加载中 ' + Math.round(done / n * 100) + '%';
+                        });
+                }(imgs[i]));
+            }
+            var timeout = new Promise(function (r) { setTimeout(r, 9000); });
+            return Promise.race([Promise.all(tasks), timeout]);
+        }
+
+        /* =========================================================
+           2. 状态与库信号读取
+           ========================================================= */
+        var flip = null;
+        var state = {
+            total: 0,
+            index: 0,             // ★我们自己的权威页码★，不再依赖库的索引
+            locked: false,
+            flipFrom: 0,
+            flipTarget: 0,
+            flipStartTs: 0,
+            awaitingFlip: false,  // 已发出翻页指令，还在等库的 flip 事件确认
+            retried: false,       // 看门狗是否已经降级重试过（防死循环）
+            watchTimer: null,
+            booted: false,
+            inited: false,
+            w: 0, h: 0
+        };
+        var lockTimer = null;
+
+        // 库的真实页码（pages.currentPageIndex）。只作“参考信号”。
+        // 只要它不是 0..total-1 之间的有效数字，一律返回 null 表示“不可信”，
+        // 这样即使它返回 -1/NaN/抛异常，也不可能把用户挡在门外。
+        function libIndex() {
+            try {
+                if (flip && typeof flip.getCurrentPageIndex === 'function') {
+                    var i = flip.getCurrentPageIndex();
+                    if (typeof i === 'number' && isFinite(i) && i >= 0 && i <= state.total - 1) return i;
+                }
+            } catch (e) {}
+            return null;
+        }
+
+        // 库的翻页控制器状态：'read'(空闲) | 'flipping'(动画中) | 'fold_corner' | 'user_fold'
+        // 这是判断“到底有没有在翻页”的唯一可靠信号（比定时器可靠得多）
+        function libState() {
+            try {
+                if (flip && typeof flip.getState === 'function') return flip.getState();
+            } catch (e) {}
+            return null;
+        }
+
+        /* ---------- 锁：自愈式 ---------- */
+        function lock() {
+            state.locked = true;
+            if (lockTimer) clearTimeout(lockTimer);
+            lockTimer = setTimeout(unlock, CFG.lockStale);   // 兜底解锁，永不死锁
+        }
+        function unlock() {
+            state.locked = false;
+            if (lockTimer) { clearTimeout(lockTimer); lockTimer = null; }
+        }
+
+        /* =========================================================
+           3. 降级方案（本次修复的核心之一）
+           ---------------------------------------------------------
+           特性检测后按“影响最小 → 最强硬”依次尝试：
+             ① turnToPage(page)                带动画；库内部先调 spread 索引再走 flipNext/flipPrev
+             ② turnToPrevPage/turnToNextPage   走 Pages.showPrev/showNext，直接切页+重绘
+                                               （没有翻页动画，但一定不会卡住）
+           注意：这些方法在库里同样可能存在，所以每一步都要 typeof 检测 + try/catch。
+           ========================================================= */
+        function hardJump(page, dir, instantOnly) {
+            if (typeof page !== 'number' || page < 0 || page > state.total - 1) return false;
+            if (!instantOnly) {
+                try {
+                    if (typeof flip.turnToPage === 'function') { flip.turnToPage(page); return true; }
+                } catch (e) { if (CFG.debug) console.warn('[flip] turnToPage 降级失败', e); }
+            }
+            try {
+                if (dir < 0 && typeof flip.turnToPrevPage === 'function') { flip.turnToPrevPage(); return true; }
+                if (dir > 0 && typeof flip.turnToNextPage === 'function') { flip.turnToNextPage(); return true; }
+            } catch (e) { if (CFG.debug) console.warn('[flip] 硬切页降级失败', e); }
+            return false;
+        }
+
+        /* 库内部 spread 索引对齐（竖屏下 spread 索引 == 页码）。
+           为什么需要：turnToPage() 会先把 spread 索引改成 target±1 再翻页，
+           万一那一翻又失败，库内部索引就和视觉页错位，下一次翻页会翻错方向。 */
+        function resyncSpread(page) {
+            try {
+                if (typeof flip.getPageCollection !== 'function') return;
+                var pc = flip.getPageCollection();
+                if (pc && typeof pc.setCurrentSpreadIndex === 'function' && typeof pc.getSpread === 'function'
+                    && pc.getSpread().length === state.total) {
+                    pc.setCurrentSpreadIndex(page);     // 只在竖屏(每页一个 spread)时才动，避免影响横屏
+                }
+            } catch (e) {}
+        }
+
+        /* =========================================================
+           4. go()：唯一的翻页入口
+           ========================================================= */
+        function callFlip(dir, target) {
+            // 首选：库的标准 API（带动画，观感最好）
+            try {
+                if (dir > 0 && typeof flip.flipNext === 'function') { flip.flipNext(); return true; }
+                if (dir < 0 && typeof flip.flipPrev === 'function') { flip.flipPrev(); return true; }
+            } catch (e) { if (CFG.debug) console.warn('[flip] 原生 API 抛错，直接降级', e); }
+            return hardJump(target, dir, false);
+        }
+
+        function scheduleWatch() {
+            if (state.watchTimer) clearTimeout(state.watchTimer);
+            state.watchTimer = setTimeout(verifyFlip, CFG.watchDelay);
+        }
+
+        /* 看门狗：翻页动画结束后，确认“这一翻是不是真的发生了”。
+           证据全部来自库源码里可验证的事实：
+             ① 库每次真的换页都会 trigger('flip', 页码)（Pages.showSpread → updatePageIndex）
+             ② flipController.getState() 会回到 'read'
+             ③ getCurrentPageIndex() 返回 pages.currentPageIndex
+           三者交叉验证，绝不会因为单一信号异常而误判。 */
+        function verifyFlip() {
+            state.watchTimer = null;
+            if (!state.awaitingFlip) { unlock(); return; }              // 收到 flip 事件 → 成功
+
+            var cs = libState();
+            if (cs === 'flipping' || cs === 'user_fold') { scheduleWatch(); return; }   // 动画还没结束，继续等
+
+            var lib = libIndex();
+            if (lib === state.flipTarget) { state.awaitingFlip = false; unlock(); return; }  // 库索引已到目标页 → 成功
+
+            var dir = state.flipTarget > state.flipFrom ? 1 : -1;
+
+            if (!state.retried) {
+                // 第一次：既没收到 flip 事件、控制器又已空闲 → 判定这次原生调用被静默吞掉了
+                if (CFG.debug) console.warn('[flip] 原生翻页被静默吞掉，启用降级 turnToPage：' + state.flipFrom + ' -> ' + state.flipTarget);
+                state.retried = true;
+                unlock();                                   // ★降级调用前必须先解锁，否则同样被锁吞掉★
+                state.awaitingFlip = true;
+                state.flipStartTs = Date.now();
+                lock();
+                if (hardJump(state.flipTarget, dir, false)) { scheduleWatch(); return; }
+                state.awaitingFlip = false;
+            }
+
+            // 第二次（或 turnToPage 不存在）：只有在“库明确还停在起始页”时才敢硬切
+            if (lib === state.flipFrom) {
+                if (CFG.debug) console.warn('[flip] 降级仍失败，硬切页兜底');
+                state.awaitingFlip = false;
+                if (hardJump(state.flipTarget, dir, true)) {
+                    resyncSpread(state.flipTarget);         // 硬切页是同步完成的，立刻对齐库内部索引
+                } else {
+                    state.index = state.flipFrom;           // 彻底失败：索引回滚，绝不留“假前进”的状态
+                    resyncSpread(state.flipFrom);
+                    if (CFG.debug) console.warn('[flip] 全部失败，索引已回滚到 ' + state.flipFrom);
+                }
+            } else {
+                state.awaitingFlip = false;                 // 索引不可信 → 不硬切，保持我们的乐观索引
+            }
+            state.retried = false;
+            unlock();
+        }
+
+        function go(dir) {   // dir: 1 下一页 / -1 上一页
+            if (!flip || state.total < 2) return false;
+            var now = Date.now();
+
+            /* ---------- 1. 锁：先自愈再判断 ----------
+               旧逻辑只能靠 changeState==='read' 或定时器解锁；
+               微信切后台/动画被打断时事件会丢，锁就永久卡死，之后每一次 flipPrev 都被静默吞掉。
+               现在用库的 getState() 判断“真的还在动画中吗”，空闲就立刻解锁。 */
+            if (state.locked) {
+                var cs = libState();
+                var stale = (now - state.flipStartTs) > CFG.lockStale;
+                if (cs === 'read' || cs === null || stale) {
+                    if (CFG.debug) console.log('[flip] 锁自愈解锁, 库状态=' + cs + ', 陈旧=' + stale);
+                    unlock();
+                } else {
+                    if (CFG.debug) console.log('[flip] 动画进行中，忽略本次手势');
+                    return false;
+                }
+            }
+
+            /* ---------- 2. 目标页：以我们自己的索引为准 ---------- */
+            var lib = libIndex();
+            var from = state.index;
+            // 索引自愈：只有“库索引”和“我们索引”明显冲突（差值>1）时才以库为准重新对齐，
+            // 避免正常翻页时被库的滞后索引带偏。
+            if (lib !== null && Math.abs(lib - from) > 1) {
+                if (CFG.debug) console.log('[flip] 索引冲突，重新对齐: ' + from + ' -> ' + lib);
+                from = lib; state.index = lib;
+            }
+            var target = from + dir;
+
+            /* ---------- 3. 真·边界：双信号确认才拦截 ----------
+               绝不像旧代码那样只信一个索引就 return false（那正是“往前翻永久失效”的另一种死法）。
+               只有“我们的索引”和“库的索引”都确认在边界，才真的拦。 */
+            if (target < 0 || target > state.total - 1) {
+                var atEdge = (dir < 0)
+                    ? (from <= 0 && (lib === null || lib <= 0))
+                    : (from >= state.total - 1 && (lib === null || lib >= state.total - 1));
+                if (atEdge) return false;                        // 真边界：外层用橡皮筋给反馈
+                target = (dir < 0) ? 0 : state.total - 1;        // 否则夹到有效范围，绝不放弃这次手势
+            }
+
+            /* ---------- 4. 乐观推进 + 调用 + 看门狗 ---------- */
+            state.flipFrom = from;
+            state.flipTarget = target;
+            state.index = target;               // 乐观推进：即使库索引滞后/异常，边界判断也始终正确
+            state.awaitingFlip = true;
+            state.retried = false;
+            state.flipStartTs = now;
+            lock();
+
+            if (!callFlip(dir, target)) {
+                state.index = from;             // 连降级都不可用：回滚，保证状态真实
+                state.awaitingFlip = false;
+                unlock();
+                return false;
+            }
+            scheduleWatch();
+            if (CFG.debug) console.log('[flip] ' + (dir > 0 ? '下一页' : '上一页') + ' ' + from + ' -> ' + target);
+            return true;
+        }
+
+        /* =========================================================
+           5. 尺寸
+           ========================================================= */
+        function computeSize() {
+            var box = stageBox();
+            var first = document.querySelector('#book img');
+            var iw = (first && first.naturalWidth) || 0;
+            var ih = (first && first.naturalHeight) || 0;
+            var ratio = (iw && ih) ? (iw / ih) : (box.w / box.h);
+            var bw, bh;
+            if (box.w / box.h > ratio) { bh = box.h; bw = bh * ratio; }
+            else { bw = box.w; bh = bw / ratio; }
+            return { w: Math.floor(bw), h: Math.floor(bh) };
+        }
+
+        function applySize(size) {
+            var bookEl = document.getElementById('book');
+            bookEl.style.width = size.w + 'px';
+            bookEl.style.height = size.h + 'px';
+            // 库在初始化时会写 min-width/min-height，不跟着改会导致转屏后尺寸卡在旧值
+            bookEl.style.minWidth = size.w + 'px';
+            bookEl.style.minHeight = size.h + 'px';
+            state.w = size.w; state.h = size.h;
+        }
+
+        function relayout() {
+            if (!flip || !state.inited) return;
+            if (typeof flip.update !== 'function') return;
+            var size = computeSize();
+            if (Math.abs(size.w - state.w) < 2 && Math.abs(size.h - state.h) < 2) return;  // 没实质变化就别动（微信地址栏收放会疯狂触发 resize）
+            applySize(size);
+            try { flip.update(); } catch (e) {}
+        }
+
+        function hideLoading() {
+            var l = document.getElementById('loading');
+            if (!l) return;
+            l.classList.add('hide');
+            setTimeout(function () { if (l.parentNode) l.parentNode.removeChild(l); }, 520);
+        }
+
+        /* =========================================================
+           6. 初始化
+           ========================================================= */
+        function initBook() {
+            if (state.inited) return;
+            state.inited = true;
+
+            var bookEl = document.getElementById('book');
+            state.total = bookEl.querySelectorAll('.page').length;
+
+            applySize(computeSize());
+
+            flip = new St.PageFlip(bookEl, {
+                width: state.w, height: state.h,
+                size: 'fixed',
+                autoSize: false,           // 自己管尺寸，别让库写 width:100%/max-width（默认 autoSize 会写 maxWidth:0px，靠 min-width 兜着，很脏）
+                showCover: true,           // 第一页为封面
+                usePortrait: true,         // 竖屏：一次一页
+                maxShadowOpacity: CFG.maxShadowOpacity,
+                flippingTime: CFG.flippingTime,
+                mobileScrollSupport: false,
+
+                /* ★★★ 本次“往前翻永久失效”的真正根因（已从库源码确认）★★★
+                   库内部实现：
+                     flip(point){ if (settings.disableFlipByClick && !isPointOnCorners(point)) return; ... }
+                     flipNext(){ flip({x: rect.left + 2*rect.pageWidth - 10, y: 1}) }
+                     flipPrev(){ flip({x: 10,                                y: 1}) }
+                     isPointOnCorners(p){ 必须落在四角“角区”(尺寸=对角线/5) 内才返回 true }
+                   竖屏时 rect = {left:-pageWidth, width:2*pageWidth, height:h}，
+                   两个点换算成书本坐标是：
+                     flipNext → x = 2*pageWidth - 10  → 命中右角区  → 正常翻页 ✔
+                     flipPrev → x = pageWidth  +  10  → 左右两个角区都不命中 → isPointOnCorners=false
+                              → flip() 直接 return：不报错、不发事件、不翻页 ✘
+                   （以 390 宽、693 高的竖版书为例：角区半径 ≈159，flipPrev 的 x≈400，
+                     既不 <159 也不 >621，所以必然被吞 —— 这就是“只能往后、不能往前”）
+                   所以必须改回 false。安全性没问题：我们所有触摸都走 #gesture 层，
+                   且下面 useMouseEvents:false 让库一个手势监听都不绑，它永远收不到点击。 */
+                disableFlipByClick: false,
+
+                // 库只有在 useMouseEvents=true 时才 setHandlers() 绑 touchstart/touchmove/touchend
+                // （而且 touchmove 还是 {passive:true}，这正是老版本微信里下拉回弹的来源）。
+                // 关掉它 → 手势 100% 归我们的 #gesture 层，不存在两套状态机抢同一个 touch。
+                useMouseEvents: false,
+                clickEventForward: false,
+                showPageCorners: false     // 关掉折角提示，省掉每次 touchmove 的折角几何+阴影计算
+            });
+
+            flip.loadFromHTML(bookEl.querySelectorAll('.page'));
+
+            // 库的 flip 事件：Pages.showSpread() → updatePageIndex(页码) → trigger('flip', 页码)
+            // 触发时机是“这次翻页真的换页之后”，data 就是真实页码数字，直接用来自校准我们的索引。
+            flip.on('flip', function (e) {
+                if (e && typeof e.data === 'number' && e.data >= 0 && e.data <= state.total - 1) {
+                    state.index = e.data;
+                }
+                state.awaitingFlip = false;        // 翻页确实发生了
+                state.retried = false;
+            });
+            flip.on('changeState', function (e) {
+                if (e && e.data === 'read') unlock();   // 动画结束 → 精确解锁（看门狗仍是兜底）
+            });
+
+            state.index = (libIndex() === null ? 0 : libIndex());
+            bindGesture();
+
+            requestAnimationFrame(function () {
+                bookEl.classList.add('show');
+                setTimeout(hideLoading, 220);
+            });
+        }
+
+        /* =========================================================
+           7. 手势层：唯一的手势入口（保留原有优点）
+           ========================================================= */
+        function bindGesture() {
+            var layer = document.getElementById('gesture');
+            var bandEl = document.getElementById('bookLayer');
+
+            var sx = 0, sy = 0, st = 0;
+            var decided = false, swiped = false, moved = false, blocked = 0;
+            var lastTouchTs = 0;
+
+            function band(dx) {
+                if (!blocked) return;
+                var d = dx * 0.35;
+                if (d > CFG.rubberMax) d = CFG.rubberMax;
+                if (d < -CFG.rubberMax) d = -CFG.rubberMax;
+                bandEl.style.transition = 'none';
+                bandEl.style.transform = 'translate3d(' + d.toFixed(1) + 'px,0,0)';
+            }
+            function releaseBand() {
+                bandEl.style.transition = 'transform .18s ease-out';
+                bandEl.style.transform = 'translate3d(0,0,0)';
+            }
+
+            function onStart(x, y) {
+                sx = x; sy = y; st = Date.now();
+                decided = false; swiped = false; moved = false; blocked = 0;
+                bandEl.style.transition = 'none';
+                bandEl.style.transform = '';
+            }
+
+            function onMove(x, y) {
+                var dx = x - sx, dy = y - sy;
+                if (Math.abs(dx) > CFG.tapMove || Math.abs(dy) > CFG.tapMove) moved = true;
+
+                if (decided) { band(dx); return; }
+                if (Math.abs(dx) < CFG.swipeThreshold && Math.abs(dy) < CFG.swipeThreshold) return;
+
+                if (Math.abs(dx) <= Math.abs(dy) * CFG.dirRatio) { decided = true; return; }   // 纵向手势，不翻页
+                decided = true;
+                swiped = true;                            // 标记为滑动 → 结束时绝不再触发点击翻页
+                if (!go(dx < 0 ? 1 : -1)) {               // 左滑=下一页；右滑=上一页
+                    blocked = dx < 0 ? 1 : -1;
+                    band(dx);                             // 到边界：给橡皮筋反馈，绝不卡死也不回弹
+                }
+            }
+
+            function onEnd(x, y) {
+                var dt = Date.now() - st;
+                var dx = x - sx, dy = y - sy;
+                releaseBand();
+
+                if (swiped) return;                       // 已翻页，吞掉点击
+                if (!moved && dt < CFG.tapMaxTime) {      // 位移极小 + 时间短 = 点击
+                    var half = (document.documentElement.clientWidth || window.innerWidth) / 2;
+                    go(x < half ? -1 : 1);                // 点击左半屏上一页 / 右半屏下一页
+                    return;
+                }
+                if (!decided && Math.abs(dx) >= CFG.releaseSwipe && Math.abs(dx) > Math.abs(dy)) {
+                    swiped = true;
+                    go(dx < 0 ? 1 : -1);                  // 松手补偿，避免手感发虚
+                }
+            }
+
+            layer.addEventListener('touchstart', function (e) {
+                lastTouchTs = Date.now();
+                if (e.touches.length !== 1) { decided = true; swiped = true; return; }   // 多指：不处理
+                onStart(e.touches[0].clientX, e.touches[0].clientY);
+            }, { passive: false });
+
+            layer.addEventListener('touchmove', function (e) {
+                if (e.cancelable) e.preventDefault();   // 掐断微信的滚动/下拉刷新/橡皮筋
+                e.stopPropagation();                    // 库的事件一律收不到（它本来也没绑，双保险）
+                if (e.touches.length !== 1) return;
+                onMove(e.touches[0].clientX, e.touches[0].clientY);
+            }, { passive: false });
+
+            var finish = function (e) {
+                if (e.cancelable) e.preventDefault();   // 阻止浏览器合成的 click，避免“点一次翻两页”
+                e.stopPropagation();
+                var t = e.changedTouches && e.changedTouches[0];
+                onEnd(t ? t.clientX : sx, t ? t.clientY : sy);
+            };
+            layer.addEventListener('touchend', finish, { passive: false });
+            layer.addEventListener('touchcancel', finish, { passive: false });
+
+            layer.addEventListener('mousedown', function (e) {
+                if (Date.now() - lastTouchTs < 800) return;
+                onStart(e.clientX, e.clientY);
+            });
+            layer.addEventListener('mousemove', function (e) {
+                if (Date.now() - lastTouchTs < 800) return;
+                if (!moved && e.buttons === 0) return;
+                onMove(e.clientX, e.clientY);
+            });
+            layer.addEventListener('mouseup', function (e) {
+                if (Date.now() - lastTouchTs < 800) return;
+                onEnd(e.clientX, e.clientY);
+            });
+
+            document.addEventListener('touchmove', function (e) {
+                if (e.cancelable) e.preventDefault();
+            }, { passive: false });
+        }
+
+        /* =========================================================
+           8. 启动 & 前后台
+           ========================================================= */
+        function boot() {
+            if (state.booted) return;
+            state.booted = true;
+
+            if (typeof St === 'undefined' || !St.PageFlip) {
+                var l = document.getElementById('loading');
+                if (l) l.textContent = '翻页组件加载失败，请检查 page-flip.browser.js 路径';
+                return;
+            }
+
+            prepareAll().then(function () {
+                initBook();
+
+                var t = null;
+                window.addEventListener('resize', function () {
+                    if (t) clearTimeout(t);
+                    t = setTimeout(relayout, 220);
+                }, { passive: true });
+
+                window.addEventListener('orientationchange', function () {
+                    if (t) clearTimeout(t);
+                    t = setTimeout(function () { setTimeout(relayout, 120); }, 260);
+                });
+            });
+        }
+
+        // 切后台再回来：不重建、不重新淡入 → 不闪不卡；只自愈解锁 + 延后两帧校正尺寸
+        document.addEventListener('visibilitychange', function () {
+            if (document.hidden) return;
+            unlock();
+            state.awaitingFlip = false;
+            state.retried = false;
+            requestAnimationFrame(function () { requestAnimationFrame(relayout); });
+        });
+
+        window.addEventListener('pageshow', function (e) {
+            if (!e || !e.persisted) return;
+            unlock();
+            state.awaitingFlip = false;
+            state.retried = false;
+            var l = document.getElementById('loading');
+            if (l && l.parentNode) l.parentNode.removeChild(l);
+            requestAnimationFrame(function () {
+                document.getElementById('book').classList.add('show');
+                relayout();
+            });
+        });
+
+        if (document.readyState === 'complete') boot();
+        else window.addEventListener('load', boot);
+    })();
+    </script>
+</body>
+</html>
